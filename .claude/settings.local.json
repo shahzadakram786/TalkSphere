@@ -3,7 +3,9 @@
     "allow": [
       "Bash(npx tsc *)",
       "Bash(npm list *)",
-      "Bash(npm install *)"
+      "Bash(npm install *)",
+      "Bash(pnpm add *)",
+      "Bash(pnpm build *)"
     ]
   }
 }
