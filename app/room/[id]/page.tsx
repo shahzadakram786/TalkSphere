@@ -15,7 +15,7 @@ export default async function Room({ params }: Props) {
   } = await supabase.auth.getUser()
 
   if (!user) {
-    redirect('/auth/login')
+    redirect('/auth/login?redirect=/')
   }
 
   // Verify room exists and user has access

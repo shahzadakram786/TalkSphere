@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useState, useRef } from 'react'
+import { useEffect, useState, useRef, useCallback } from 'react'
 import { createClient } from '@/lib/supabase/client'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -12,6 +12,7 @@ import {
   CardTitle,
 } from '@/components/ui/card'
 import { useRouter } from 'next/navigation'
+import Link from 'next/link'
 import {
   Mic,
   MicOff,
@@ -23,6 +24,7 @@ import {
   ArrowLeft,
   RefreshCw,
   Crown,
+  Loader2,
 } from 'lucide-react'
 import WebRTCManager from '@/lib/webrtc-manager'
 import {
@@ -31,6 +33,7 @@ import {
   leaveRoom as socketLeaveRoom,
   onUserJoined,
   onUserLeft,
+  onRoomUsers,
   sendOffer,
   sendAnswer,
   sendIceCandidate,
@@ -72,6 +75,13 @@ interface Message {
   created_at: string
 }
 
+interface RemoteVideo {
+  odiceId: string
+  stream: MediaStream
+  displayName: string
+  avatarUrl: string | null
+}
+
 interface RoomInfo {
   id: string
   name: string
@@ -96,23 +106,36 @@ export default function RoomPage({ roomId }: RoomPageProps) {
   const [currentUser, setCurrentUser] = useState<any>(null)
   const [loading, setLoading] = useState(true)
   const [showLeaveConfirm, setShowLeaveConfirm] = useState(false)
+  const [connectionStatus, setConnectionStatus] = useState<'connecting' | 'connected' | 'disconnected'>('disconnected')
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const webrtcManagerRef = useRef<WebRTCManager | null>(null)
-  const remoteStreamsRef = useRef<Map<string, MediaStream>>(new Map())
   const localVideoRef = useRef<HTMLVideoElement>(null)
+  const remoteVideoRefs = useRef<Map<string, HTMLVideoElement>>(new Map())
   const channelParticipantsRef = useRef<any>(null)
   const channelMessagesRef = useRef<any>(null)
+  const [remoteVideos, setRemoteVideos] = useState<RemoteVideo[]>([])
+  const [localStreamReady, setLocalStreamReady] = useState(false)
+  const isMountedRef = useRef(false)
+
+  useEffect(() => {
+    isMountedRef.current = true
+    return () => {
+      isMountedRef.current = false
+    }
+  }, [])
 
   useEffect(() => {
     initializeRoom()
     return () => {
       // Cleanup on unmount
-      leaveRoom()
-      if (webrtcManagerRef.current) {
-        webrtcManagerRef.current.closeAllConnections()
-        webrtcManagerRef.current.stopLocalStream()
+      if (isMountedRef.current) {
+        leaveRoom()
+        if (webrtcManagerRef.current) {
+          webrtcManagerRef.current.closeAllConnections()
+          webrtcManagerRef.current.stopLocalStream()
+        }
+        disconnectSocket()
       }
-      disconnectSocket()
     }
   }, [roomId])
 
@@ -127,21 +150,37 @@ export default function RoomPage({ roomId }: RoomPageProps) {
     const interval = setInterval(() => {
       loadParticipants()
       loadMessages()
-    }, 5000) // Refresh every 5 seconds
+    }, 10000) // Refresh every 10 seconds to avoid rate limiting
 
     return () => clearInterval(interval)
   }, [loading, roomId])
 
   // Attach local stream to video element
   useEffect(() => {
-    if (webrtcManagerRef.current && localVideoRef.current) {
-      const localStream = webrtcManagerRef.current.getLocalStream()
-      if (localStream) {
-        localVideoRef.current.srcObject = localStream
-        console.log('[v0] Local stream attached to video element')
+    const attachStream = async () => {
+      if (webrtcManagerRef.current && localVideoRef.current && localStreamReady) {
+        const localStream = webrtcManagerRef.current.getLocalStream()
+        if (localStream) {
+          // Only attach if video is enabled
+          if (localStream.getVideoTracks().length > 0 && localStream.getVideoTracks()[0].enabled) {
+            localVideoRef.current.srcObject = localStream
+            try {
+              if (localVideoRef.current.paused) {
+                await localVideoRef.current.play()
+              }
+            } catch (e) {
+              // Ignore play errors - common when switching streams
+            }
+          } else if (isVideoEnabled && isAudioEnabled) {
+            // Video is enabled but no video track - attach anyway
+            localVideoRef.current.srcObject = localStream
+          }
+        }
       }
     }
-  }, [isAudioEnabled, isVideoEnabled])
+
+    attachStream()
+  }, [isAudioEnabled, isVideoEnabled, localStreamReady])
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -176,21 +215,29 @@ export default function RoomPage({ roomId }: RoomPageProps) {
 
       setCurrentUser(userProfile)
 
-      // Join room
-      const { data: existingParticipant } = await supabase
+      // Join room - check for existing participation
+      const { data: existingParticipants } = await supabase
         .from('room_participants')
         .select('id')
         .eq('room_id', roomId)
         .eq('user_id', authUser.id)
-        .single()
+        .is('left_at', null)
 
-      if (!existingParticipant) {
+      if (!existingParticipants || existingParticipants.length === 0) {
         await supabase.from('room_participants').insert({
           room_id: roomId,
           user_id: authUser.id,
           is_audio_enabled: true,
           is_video_enabled: false,
         })
+      } else if (existingParticipants.length > 1) {
+        // Clean up duplicates - keep only the first one
+        const keepId = existingParticipants[0].id
+        const deleteIds = existingParticipants.slice(1).map(p => p.id)
+        await supabase
+          .from('room_participants')
+          .delete()
+          .in('id', deleteIds)
       }
 
       // Initialize WebRTC Manager
@@ -198,11 +245,17 @@ export default function RoomPage({ roomId }: RoomPageProps) {
 
       // Initialize local stream (audio only by default)
       try {
-        await webrtcManagerRef.current.initializeLocalStream(
-          isAudioEnabled,
-          isVideoEnabled
-        )
+        // Ensure at least one of audio/video is enabled to avoid getUserMedia error
+        const audioEnabled = isAudioEnabled
+        const videoEnabled = isVideoEnabled
+        if (!audioEnabled && !videoEnabled) {
+          // Default to audio if both are disabled
+          await webrtcManagerRef.current.initializeLocalStream(true, false)
+        } else {
+          await webrtcManagerRef.current.initializeLocalStream(audioEnabled, videoEnabled)
+        }
         console.log('[v0] Local stream initialized, audio:', isAudioEnabled, 'video:', isVideoEnabled)
+        setLocalStreamReady(true)
       } catch (error) {
         console.warn('[v0] Could not get user media:', error)
       }
@@ -211,14 +264,28 @@ export default function RoomPage({ roomId }: RoomPageProps) {
       const socket = initializeSocket()
       console.log('[v0] Socket initialized, connected:', socket?.connected)
 
+      // Track socket connection status
+      socket.on('connect', () => {
+        setConnectionStatus('connected')
+        console.log('[v0] Socket connected')
+      })
+
+      socket.on('disconnect', () => {
+        setConnectionStatus('disconnected')
+        console.log('[v0] Socket disconnected')
+      })
+
       // Join room via Socket.io for WebRTC signaling
       if (userProfile) {
         joinRoom(roomId, authUser.id, userProfile.display_name)
         console.log('[v0] Joined room via socket:', roomId)
       }
 
-      // Setup WebRTC signal handlers
-      setupWebRTCSignaling(authUser.id)
+      // Setup WebRTC signal handlers after a short delay to ensure socket is connected
+      setTimeout(() => {
+        setupWebRTCSignaling(authUser.id)
+        console.log('[v0] WebRTC signaling setup complete')
+      }, 1000)
 
       // Load participants
       loadParticipants()
@@ -226,10 +293,11 @@ export default function RoomPage({ roomId }: RoomPageProps) {
       // Load messages
       loadMessages()
 
-      // Subscribe to real-time updates (with error handling)
+      // Subscribe to real-time updates - must add callbacks BEFORE subscribe
       try {
         channelParticipantsRef.current = supabase.channel(`room:${roomId}:participants`)
 
+        // Add callback first
         channelParticipantsRef.current.on(
           'postgres_changes',
           {
@@ -243,6 +311,7 @@ export default function RoomPage({ roomId }: RoomPageProps) {
           }
         )
 
+        // Then subscribe
         channelParticipantsRef.current.subscribe((status: string) => {
           if (status === 'SUBSCRIBED') {
             console.log('[v0] Participants channel subscribed')
@@ -255,6 +324,7 @@ export default function RoomPage({ roomId }: RoomPageProps) {
       try {
         channelMessagesRef.current = supabase.channel(`room:${roomId}:messages`)
 
+        // Add callback first
         channelMessagesRef.current.on(
           'postgres_changes',
           {
@@ -302,32 +372,65 @@ export default function RoomPage({ roomId }: RoomPageProps) {
 
   const setupWebRTCSignaling = (currentUserId: string) => {
     const socket = getSocket()
-    if (!socket) return
+    if (!socket) {
+      console.log('[v0] Socket not available')
+      return
+    }
 
-    // Handle incoming offer
+    console.log('[v0] Setting up WebRTC signaling for user:', currentUserId)
+
+    // Handle incoming offer (when someone calls us)
     onWebRTCOffer(roomId, ({ fromUserId, offer }) => {
-      if (!webrtcManagerRef.current) return
+      console.log('[v0] Received offer from:', fromUserId)
+      if (!webrtcManagerRef.current) {
+        console.log('[v0] WebRTC manager not available')
+        return
+      }
+
+      // Always close existing connection and create new one
+      // This handles cases where video was toggled and we need new stream
+      if (webrtcManagerRef.current.isConnectedTo(fromUserId)) {
+        console.log('[v0] Closing existing connection to:', fromUserId)
+        webrtcManagerRef.current.closePeerConnection(fromUserId)
+        setRemoteVideos(prev => prev.filter(v => v.odiceId !== fromUserId))
+      }
 
       const peer = webrtcManagerRef.current.createPeerConnection(
         fromUserId,
-        false,
+        false, // Not initiator, we received an offer
         (stream) => {
-          remoteStreamsRef.current.set(fromUserId, stream)
+          console.log('[v0] Received stream from:', fromUserId)
+          const participant = participants.find(p => p.user_id === fromUserId)
+          setRemoteVideos(prev => {
+            if (prev.some(v => v.odiceId === fromUserId)) {
+              return prev
+            }
+            return [...prev, {
+              odiceId: fromUserId,
+              stream,
+              displayName: participant?.display_name || 'User',
+              avatarUrl: participant?.avatar_url || null
+            }]
+          })
         },
         (signal) => {
+          console.log('[v0] Sending answer to:', fromUserId)
           sendAnswer(roomId, fromUserId, signal)
         },
         (error) => console.error('[v0] Peer error:', error),
         () => {
-          remoteStreamsRef.current.delete(fromUserId)
+          console.log('[v0] Peer connection closed:', fromUserId)
+          setRemoteVideos(prev => prev.filter(v => v.odiceId !== fromUserId))
         }
       )
 
+      console.log('[v0] Signaling offer to peer')
       peer.signal(offer)
     })
 
-    // Handle incoming answer
+    // Handle incoming answer (when we call someone and they answer)
     onWebRTCAnswer(roomId, ({ fromUserId, answer }) => {
+      console.log('[v0] Received answer from:', fromUserId)
       if (!webrtcManagerRef.current) return
 
       webrtcManagerRef.current.addSignal(fromUserId, answer)
@@ -335,39 +438,135 @@ export default function RoomPage({ roomId }: RoomPageProps) {
 
     // Handle incoming ICE candidate
     onWebRTCIceCandidate(roomId, ({ fromUserId, candidate }) => {
+      console.log('[v0] Received ICE from:', fromUserId)
       if (!webrtcManagerRef.current) return
 
       webrtcManagerRef.current.addSignal(fromUserId, candidate)
     })
 
-    // Handle user joined
+    // Handle existing users in room (when we join, we get a list of users already there)
+    onRoomUsers(roomId, (existingUsers) => {
+      console.log('[v0] Existing users in room:', existingUsers.length)
+      existingUsers.forEach((user: any) => {
+        if (user.userId !== currentUserId && webrtcManagerRef.current && !webrtcManagerRef.current.isConnectedTo(user.userId)) {
+          console.log('[v0] Connecting to existing user:', user.userId)
+          const peer = webrtcManagerRef.current.createPeerConnection(
+            user.userId,
+            true,
+            (stream) => {
+              console.log('[v0] Received stream from existing user:', user.userId)
+              setRemoteVideos(prev => {
+                if (prev.some(v => v.odiceId === user.userId)) {
+                  return prev
+                }
+                return [...prev, {
+                  odiceId: user.userId,
+                  stream,
+                  displayName: user.userName || 'User',
+                  avatarUrl: null
+                }]
+              })
+            },
+            (signal) => {
+              console.log('[v0] Sending offer to existing user:', user.userId)
+              sendOffer(roomId, user.userId, signal)
+            },
+            (error) => console.error('[v0] Peer error:', error),
+            () => {
+              console.log('[v0] Peer connection closed for:', user.userId)
+              setRemoteVideos(prev => prev.filter(v => v.odiceId !== user.userId))
+            }
+          )
+        }
+      })
+    })
+
+    // Handle user joined (when a new user joins, we call them)
     onUserJoined(roomId, ({ userId, userName }) => {
+      console.log('[v0] User joined:', userId, userName)
       if (userId === currentUserId || !webrtcManagerRef.current) return
 
-      // Create peer connection for new user
+      // If we already have a connection, skip
+      if (webrtcManagerRef.current.isConnectedTo(userId)) {
+        console.log('[v0] Already connected to:', userId)
+        return
+      }
+
+      // Create peer connection for new user (we are the initiator)
+      console.log('[v0] Creating peer connection for:', userId)
       const peer = webrtcManagerRef.current.createPeerConnection(
         userId,
-        true,
+        true, // Initiator - we start the call
         (stream) => {
-          remoteStreamsRef.current.set(userId, stream)
+          console.log('[v0] Received stream from new user:', userId)
+          setRemoteVideos(prev => {
+            if (prev.some(v => v.odiceId === userId)) {
+              return prev
+            }
+            return [...prev, {
+              odiceId: userId,
+              stream,
+              displayName: userName || 'User',
+              avatarUrl: null
+            }]
+          })
         },
         (signal) => {
+          console.log('[v0] Sending offer to:', userId)
           sendOffer(roomId, userId, signal)
         },
         (error) => console.error('[v0] Peer error:', error),
         () => {
-          remoteStreamsRef.current.delete(userId)
+          console.log('[v0] Peer connection closed for:', userId)
+          setRemoteVideos(prev => prev.filter(v => v.odiceId !== userId))
         }
       )
     })
 
     // Handle user left
     onUserLeft(roomId, (userId) => {
+      console.log('[v0] User left:', userId)
       if (webrtcManagerRef.current) {
         webrtcManagerRef.current.closePeerConnection(userId)
       }
-      remoteStreamsRef.current.delete(userId)
+      setRemoteVideos(prev => prev.filter(v => v.odiceId !== userId))
     })
+  }
+
+  // Helper to set up a peer connection with a specific user
+  const setupSinglePeerConnection = (userId: string, userName?: string) => {
+    if (!webrtcManagerRef.current || webrtcManagerRef.current.isConnectedTo(userId)) {
+      return
+    }
+
+    console.log('[v0] Setting up peer connection with:', userId)
+    const peer = webrtcManagerRef.current.createPeerConnection(
+      userId,
+      true, // We're the initiator
+      (stream) => {
+        console.log('[v0] Received stream from:', userId)
+        setRemoteVideos(prev => {
+          if (prev.some(v => v.odiceId === userId)) {
+            return prev
+          }
+          return [...prev, {
+            odiceId: userId,
+            stream,
+            displayName: userName || 'User',
+            avatarUrl: null
+          }]
+        })
+      },
+      (signal) => {
+        console.log('[v0] Sending offer to:', userId)
+        sendOffer(roomId, userId, signal)
+      },
+      (error) => console.error('[v0] Peer error:', error),
+      () => {
+        console.log('[v0] Peer connection closed for:', userId)
+        setRemoteVideos(prev => prev.filter(v => v.odiceId !== userId))
+      }
+    )
   }
 
   const loadParticipants = async () => {
@@ -402,9 +601,17 @@ export default function RoomPage({ roomId }: RoomPageProps) {
       }
 
       if (data) {
-        const participantsList = data.map((p: any) => ({
+        // Remove duplicates based on user_id
+        const uniqueUsers = new Map()
+        data.forEach((p: any) => {
+          if (!uniqueUsers.has(p.user_id)) {
+            uniqueUsers.set(p.user_id, p)
+          }
+        })
+
+        const participantsList = Array.from(uniqueUsers.values()).map((p: any) => ({
           id: p.id,
-          user_id: p.user_id,
+          odiceId: p.user_id,
           username: p.users?.username,
           display_name: p.users?.display_name,
           avatar_url: p.users?.avatar_url,
@@ -509,17 +716,61 @@ export default function RoomPage({ roomId }: RoomPageProps) {
     const newState = !isVideoEnabled
     setIsVideoEnabled(newState)
 
-    // Reinitialize local stream with new video state
     if (webrtcManagerRef.current) {
-      try {
-        await webrtcManagerRef.current.initializeLocalStream(isAudioEnabled, newState)
-        const localStream = webrtcManagerRef.current.getLocalStream()
-        if (localStream && localVideoRef.current) {
-          localVideoRef.current.srcObject = localStream
+      const currentStream = webrtcManagerRef.current.getLocalStream()
+
+      if (newState) {
+        // Turning video ON - reinitialize stream with both audio and video
+        try {
+          const newStream = await webrtcManagerRef.current.initializeLocalStream(true, true)
+          if (localVideoRef.current && newStream) {
+            localVideoRef.current.srcObject = newStream
+            localVideoRef.current.play().catch(console.error)
+          }
+
+          // Close all existing peer connections - they'll be recreated with the new stream
+          const existingPeers = Array.from(webrtcManagerRef.current.getPeers().keys())
+          existingPeers.forEach(peerUserId => {
+            webrtcManagerRef.current?.closePeerConnection(peerUserId)
+            setRemoteVideos(prev => prev.filter(v => v.odiceId !== peerUserId))
+          })
+
+          // Trigger reconnection after a short delay
+          // We need to wait for connections to fully close before creating new ones
+          setTimeout(async () => {
+            // Reload participants to get updated list
+            const { data } = await supabase
+              .from('room_participants')
+              .select('user_id')
+              .eq('room_id', roomId)
+              .is('left_at', null)
+
+            if (data && currentUser) {
+              const otherUsers = data.filter(p => p.user_id !== currentUser.id)
+              // Create new connections for all other users
+              for (const p of otherUsers) {
+                if (!webrtcManagerRef.current?.isConnectedTo(p.user_id)) {
+                  setupSinglePeerConnection(p.user_id, 'User')
+                }
+              }
+            }
+          }, 1000)
+
+          console.log('[v0] Video toggled ON - reconnecting')
+        } catch (error) {
+          console.error('[v0] Error enabling video:', error)
         }
-        console.log('[v0] Video toggled, new state:', newState)
-      } catch (error) {
-        console.error('[v0] Error toggling video:', error)
+      } else {
+        // Turning video OFF - just disable the video track
+        if (currentStream) {
+          currentStream.getVideoTracks().forEach(track => {
+            track.enabled = false
+          })
+          if (localVideoRef.current) {
+            localVideoRef.current.srcObject = null
+          }
+        }
+        console.log('[v0] Video toggled OFF')
       }
     }
 
@@ -595,31 +846,38 @@ export default function RoomPage({ roomId }: RoomPageProps) {
   }
 
   return (
-    <div className="min-h-screen bg-background">
+    <div className="min-h-screen bg-background flex flex-col">
       {/* Header */}
       <header className="border-b bg-card sticky top-0 z-10">
-        <div className="container mx-auto flex items-center justify-between px-4 py-4">
-          <div className="flex items-center gap-4">
-            <Button variant="ghost" size="sm" onClick={() => router.push('/')}>
-              <ArrowLeft className="h-4 w-4" />
-            </Button>
-            <div>
-              <h1 className="text-2xl font-bold">{room?.name}</h1>
-              <p className="text-sm text-muted-foreground">
-                {participants.length} participant
-                {participants.length !== 1 ? 's' : ''}
-                {room?.host_id === currentUser?.id && ' • You are the owner'}
+        <div className="container mx-auto flex items-center justify-between px-2 sm:px-4 py-3 sm:py-4 gap-2">
+          <div className="flex items-center gap-2 sm:gap-4 min-w-0">
+            <Link href="/" className="flex items-center gap-2 flex-shrink-0">
+              <img
+                src="/Untitled design/favicon.png"
+                alt="TalkSphere"
+                className="h-8 w-8 sm:h-10 sm:w-10 rounded-lg bg-white p-1"
+              />
+              <h1 className="text-lg sm:text-xl font-bold hidden sm:block">TalkSphere</h1>
+            </Link>
+            <div className="hidden md:block border-l h-8 mx-2" />
+            <div className="min-w-0">
+              <h2 className="text-base sm:text-lg font-semibold truncate">{room?.name}</h2>
+              <p className="text-xs sm:text-sm text-muted-foreground">
+                <span className="hidden sm:inline">{participants.length} participant{participants.length !== 1 ? 's' : ''}</span>
+                <span className="sm:hidden">{participants.length}</span>
+                {room?.host_id === currentUser?.id && <span className="hidden md:inline"> • Owner</span>}
               </p>
             </div>
           </div>
-          <div className="flex items-center gap-2">
-            <Button variant="outline" size="sm" onClick={() => { loadParticipants(); loadMessages(); }}>
+          <div className="flex items-center gap-1 sm:gap-2 flex-shrink-0">
+            <Button variant="outline" size="sm" onClick={() => { loadParticipants(); loadMessages(); }} className="p-2 sm:px-3">
               <RefreshCw className="h-4 w-4" />
             </Button>
             <Button
               variant={isAudioEnabled ? 'default' : 'destructive'}
               size="sm"
               onClick={toggleAudio}
+              className="p-2 sm:px-3"
             >
               {isAudioEnabled ? (
                 <Mic className="h-4 w-4" />
@@ -631,6 +889,7 @@ export default function RoomPage({ roomId }: RoomPageProps) {
               variant={isVideoEnabled ? 'default' : 'outline'}
               size="sm"
               onClick={toggleVideo}
+              className="p-2 sm:px-3"
             >
               {isVideoEnabled ? (
                 <Video className="h-4 w-4" />
@@ -638,19 +897,19 @@ export default function RoomPage({ roomId }: RoomPageProps) {
                 <VideoOff className="h-4 w-4" />
               )}
             </Button>
-            <Button variant="destructive" size="sm" onClick={handleLeaveRoomClick}>
+            <Button variant="destructive" size="sm" onClick={handleLeaveRoomClick} className="p-2 sm:px-3">
               <Phone className="h-4 w-4" />
             </Button>
           </div>
         </div>
       </header>
 
-      {/* Main Content - Fixed Layout */}
-      <main className="h-[calc(100vh-73px)] flex">
+      {/* Main Content - Responsive Layout */}
+      <main className="h-[calc(100vh-73px)] flex flex-col sm:flex-row">
         {/* Left Side - Video Area */}
-        <div className="flex-1 p-4 overflow-y-auto">
+        <div className="flex-1 p-2 sm:p-4 overflow-y-auto min-h-0">
           {/* Video Grid */}
-          <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4 mb-6">
+          <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-2 sm:gap-4 mb-4 sm:mb-6">
             {/* Local Video */}
             <div className="relative aspect-video bg-muted rounded-lg overflow-hidden">
               {isVideoEnabled ? (
@@ -690,21 +949,57 @@ export default function RoomPage({ roomId }: RoomPageProps) {
               </div>
             </div>
 
-            {/* Remote Videos - will be populated by WebRTC */}
-            {participants.filter(p => p.user_id !== currentUser?.id && p.is_video_enabled).map((participant) => (
-              <div key={participant.id} className="relative aspect-video bg-muted rounded-lg overflow-hidden">
-                <div className="absolute inset-0 flex items-center justify-center">
-                  <Avatar className="w-16 h-16">
-                    <AvatarImage src={participant.avatar_url || ''} alt={participant.display_name} />
+            {/* Remote Videos - populated by WebRTC */}
+            {remoteVideos.map((video) => (
+              <div key={video.odiceId} className="relative aspect-video bg-muted rounded-lg overflow-hidden">
+                <video
+                  ref={(el) => {
+                    if (el && el.srcObject !== video.stream) {
+                      el.srcObject = video.stream
+                      el.play().catch(console.error)
+                    }
+                    remoteVideoRefs.current.set(video.odiceId, el)
+                  }}
+                  autoPlay
+                  playsInline
+                  muted={false}
+                  className="w-full h-full object-cover"
+                />
+                {/* Show avatar as overlay on video (semi-transparent) */}
+                <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+                  <Avatar className="w-16 h-16 border-2 border-white bg-black/50">
+                    <AvatarImage src={video.avatarUrl || ''} alt={video.displayName} />
                     <AvatarFallback className="text-2xl font-bold">
-                      {(participant.display_name || 'U').charAt(0).toUpperCase()}
+                      {(video.displayName || 'U').charAt(0).toUpperCase()}
                     </AvatarFallback>
                   </Avatar>
                 </div>
-                <div className="absolute bottom-2 left-2">
-                  <p className="text-xs text-white bg-black/50 px-2 py-1 rounded">{participant.display_name}</p>
+                <div className="absolute bottom-2 left-2 z-10">
+                  <p className="text-xs text-white bg-black/50 px-2 py-1 rounded">{video.displayName}</p>
+                </div>
+                <div className="absolute bottom-2 right-2 z-10">
+                  {connectionStatus === 'connected' ? (
+                    <div className="bg-green-500 p-1 rounded-full">
+                      <Mic className="h-3 w-3 text-white" />
+                    </div>
+                  ) : (
+                    <Loader2 className="h-3 w-3 animate-spin text-white" />
+                  )}
                 </div>
               </div>
+            ))}
+
+            {/* Hidden audio elements for remote streams */}
+            {remoteVideos.map((video) => (
+              <audio
+                key={`audio-${video.odiceId}`}
+                ref={(el) => {
+                  if (el && el.srcObject !== video.stream) {
+                    el.srcObject = video.stream
+                  }
+                }}
+                autoPlay
+              />
             ))}
           </div>
 
@@ -758,10 +1053,10 @@ export default function RoomPage({ roomId }: RoomPageProps) {
           </div>
         </div>
 
-        {/* Right Side - Chat (Fixed/Sticky) */}
-        <div className="w-80 border-l bg-card flex flex-col">
-          <div className="p-4 border-b">
-            <CardTitle className="text-lg">Chat</CardTitle>
+        {/* Right Side - Chat - full width on mobile, sidebar on desktop */}
+        <div className="w-full sm:w-80 border-t sm:border-l bg-card flex flex-col h-1/3 sm:h-full min-h-[200px] sm:min-h-0">
+          <div className="p-3 sm:p-4 border-b">
+            <CardTitle className="text-base sm:text-lg">Chat</CardTitle>
           </div>
           {/* Messages */}
           <div className="flex-1 overflow-y-auto p-4 space-y-3">
