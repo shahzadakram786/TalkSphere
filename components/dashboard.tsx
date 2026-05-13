@@ -528,11 +528,11 @@ export default function Dashboard({ user: initialUser }: Props) {
           <div className="flex items-center gap-1 sm:gap-2">
             {user ? (
               <>
-                <Button variant="outline" size="sm" onClick={loadUserAndRooms} className="hidden sm:flex">
+                <Button variant="outline" size="sm" onClick={() => loadUserAndRooms()} className="hidden sm:flex">
                   <RefreshCw className="h-4 w-4 mr-1" />
                   <span className="hidden lg:inline">Refresh</span>
                 </Button>
-                <Button variant="outline" size="sm" onClick={loadUserAndRooms} className="sm:hidden p-2">
+                <Button variant="outline" size="sm" onClick={() => loadUserAndRooms()} className="sm:hidden p-2">
                   <RefreshCw className="h-4 w-4" />
                 </Button>
                 <DropdownMenu>

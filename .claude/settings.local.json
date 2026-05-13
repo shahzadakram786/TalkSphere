@@ -7,7 +7,10 @@
       "Bash(pnpm add *)",
       "Bash(pnpm build *)",
       "Bash(Remove-Item -Recurse -Force .next -ErrorAction SilentlyContinue)",
-      "Bash(npx next *)"
+      "Bash(npx next *)",
+      "Bash(npm run *)",
+      "Bash(Start-Sleep *)",
+      "Bash(powershell *)"
     ]
   }
 }

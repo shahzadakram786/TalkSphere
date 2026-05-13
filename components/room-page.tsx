@@ -101,7 +101,7 @@ export default function RoomPage({ roomId }: RoomPageProps) {
   const [participants, setParticipants] = useState<Participant[]>([])
   const [messages, setMessages] = useState<Message[]>([])
   const [messageInput, setMessageInput] = useState('')
-  const [isAudioEnabled, setIsAudioEnabled] = useState(true)
+  const [isAudioEnabled, setIsAudioEnabled] = useState(false)
   const [isVideoEnabled, setIsVideoEnabled] = useState(false)
   const [currentUser, setCurrentUser] = useState<any>(null)
   const [loading, setLoading] = useState(true)
@@ -115,6 +115,9 @@ export default function RoomPage({ roomId }: RoomPageProps) {
   const channelMessagesRef = useRef<any>(null)
   const [remoteVideos, setRemoteVideos] = useState<RemoteVideo[]>([])
   const [localStreamReady, setLocalStreamReady] = useState(false)
+  const [isSpeaking, setIsSpeaking] = useState(false)
+  const audioContextRef = useRef<AudioContext | null>(null)
+  const analyserRef = useRef<AnalyserNode | null>(null)
   const isMountedRef = useRef(false)
 
   useEffect(() => {
@@ -233,7 +236,7 @@ export default function RoomPage({ roomId }: RoomPageProps) {
       } else if (existingParticipants.length > 1) {
         // Clean up duplicates - keep only the first one
         const keepId = existingParticipants[0].id
-        const deleteIds = existingParticipants.slice(1).map(p => p.id)
+        const deleteIds = existingParticipants.slice(1).map((p: { id: string }) => p.id)
         await supabase
           .from('room_participants')
           .delete()
@@ -243,21 +246,24 @@ export default function RoomPage({ roomId }: RoomPageProps) {
       // Initialize WebRTC Manager
       webrtcManagerRef.current = new WebRTCManager()
 
-      // Initialize local stream (audio only by default)
-      try {
-        // Ensure at least one of audio/video is enabled to avoid getUserMedia error
-        const audioEnabled = isAudioEnabled
-        const videoEnabled = isVideoEnabled
-        if (!audioEnabled && !videoEnabled) {
-          // Default to audio if both are disabled
-          await webrtcManagerRef.current.initializeLocalStream(true, false)
-        } else {
+      // Initialize local stream only if audio or video is enabled
+      const audioEnabled = isAudioEnabled
+      const videoEnabled = isVideoEnabled
+      if (audioEnabled || videoEnabled) {
+        try {
           await webrtcManagerRef.current.initializeLocalStream(audioEnabled, videoEnabled)
+          console.log('[v0] Local stream initialized, audio:', audioEnabled, 'video:', videoEnabled)
+          setLocalStreamReady(true)
+
+          // Set up voice activity detection
+          if (audioEnabled) {
+            setupVoiceActivityDetection()
+          }
+        } catch (error) {
+          console.warn('[v0] Could not get user media:', error)
         }
-        console.log('[v0] Local stream initialized, audio:', isAudioEnabled, 'video:', isVideoEnabled)
-        setLocalStreamReady(true)
-      } catch (error) {
-        console.warn('[v0] Could not get user media:', error)
+      } else {
+        console.log('[v0] No media enabled - waiting for user to enable')
       }
 
       // Initialize Socket.io
@@ -293,65 +299,29 @@ export default function RoomPage({ roomId }: RoomPageProps) {
       // Load messages
       loadMessages()
 
-      // Subscribe to real-time updates - must add callbacks BEFORE subscribe
-      try {
-        channelParticipantsRef.current = supabase.channel(`room:${roomId}:participants`)
+      // Subscribe to real-time updates for participants
+      // Subscribe to real-time updates - use polling as fallback
+      // Supabase realtime can have issues with callback ordering
+      console.log('[v0] Setting up polling for participants and messages')
 
-        // Add callback first
-        channelParticipantsRef.current.on(
-          'postgres_changes',
-          {
-            event: '*',
-            schema: 'public',
-            table: 'room_participants',
-            filter: `room_id=eq.${roomId}`,
-          },
-          () => {
-            loadParticipants()
-          }
-        )
+      // Just use polling - more reliable
+      const pollInterval = setInterval(() => {
+        if (!loading) {
+          loadParticipants()
+          loadMessages()
+        }
+      }, 5000)
 
-        // Then subscribe
-        channelParticipantsRef.current.subscribe((status: string) => {
-          if (status === 'SUBSCRIBED') {
-            console.log('[v0] Participants channel subscribed')
-          }
-        })
-      } catch (err) {
-        console.warn('[v0] Participants channel error:', err)
-      }
+      setLoading(false)
 
-      try {
-        channelMessagesRef.current = supabase.channel(`room:${roomId}:messages`)
-
-        // Add callback first
-        channelMessagesRef.current.on(
-          'postgres_changes',
-          {
-            event: 'INSERT',
-            schema: 'public',
-            table: 'messages',
-            filter: `room_id=eq.${roomId}`,
-          },
-          (payload: any) => {
-            const newMessage: Message = {
-              id: payload.new.id,
-              content: payload.new.content,
-              user_id: payload.new.user_id,
-              display_name: '',
-              created_at: payload.new.created_at,
-            }
-            setMessages((prev) => [...prev, newMessage])
-          }
-        )
-
-        channelMessagesRef.current.subscribe((status: string) => {
-          if (status === 'SUBSCRIBED') {
-            console.log('[v0] Messages channel subscribed')
-          }
-        })
-      } catch (err) {
-        console.warn('[v0] Messages channel error:', err)
+      return () => {
+        clearInterval(pollInterval)
+        if (channelParticipantsRef.current) {
+          supabase.removeChannel(channelParticipantsRef.current)
+        }
+        if (channelMessagesRef.current) {
+          supabase.removeChannel(channelMessagesRef.current)
+        }
       }
 
       setLoading(false)
@@ -380,7 +350,12 @@ export default function RoomPage({ roomId }: RoomPageProps) {
     console.log('[v0] Setting up WebRTC signaling for user:', currentUserId)
 
     // Handle incoming offer (when someone calls us)
-    onWebRTCOffer(roomId, ({ fromUserId, offer }) => {
+    onWebRTCOffer(roomId, ({ fromUserId, targetUserId, offer }) => {
+      // Only process if this offer is meant for us
+      if (targetUserId !== currentUserId) {
+        console.log('[v0] Ignoring offer meant for:', targetUserId)
+        return
+      }
       console.log('[v0] Received offer from:', fromUserId)
       if (!webrtcManagerRef.current) {
         console.log('[v0] WebRTC manager not available')
@@ -415,7 +390,7 @@ export default function RoomPage({ roomId }: RoomPageProps) {
         },
         (signal) => {
           console.log('[v0] Sending answer to:', fromUserId)
-          sendAnswer(roomId, fromUserId, signal)
+          sendAnswer(roomId, currentUserId, fromUserId, signal)
         },
         (error) => console.error('[v0] Peer error:', error),
         () => {
@@ -429,7 +404,12 @@ export default function RoomPage({ roomId }: RoomPageProps) {
     })
 
     // Handle incoming answer (when we call someone and they answer)
-    onWebRTCAnswer(roomId, ({ fromUserId, answer }) => {
+    onWebRTCAnswer(roomId, ({ fromUserId, targetUserId, answer }) => {
+      // Only process if this answer is meant for us
+      if (targetUserId !== currentUserId) {
+        console.log('[v0] Ignoring answer meant for:', targetUserId)
+        return
+      }
       console.log('[v0] Received answer from:', fromUserId)
       if (!webrtcManagerRef.current) return
 
@@ -437,7 +417,12 @@ export default function RoomPage({ roomId }: RoomPageProps) {
     })
 
     // Handle incoming ICE candidate
-    onWebRTCIceCandidate(roomId, ({ fromUserId, candidate }) => {
+    onWebRTCIceCandidate(roomId, ({ fromUserId, targetUserId, candidate }) => {
+      // Only process if this ICE is meant for us
+      if (targetUserId !== currentUserId) {
+        console.log('[v0] Ignoring ICE meant for:', targetUserId)
+        return
+      }
       console.log('[v0] Received ICE from:', fromUserId)
       if (!webrtcManagerRef.current) return
 
@@ -469,7 +454,7 @@ export default function RoomPage({ roomId }: RoomPageProps) {
             },
             (signal) => {
               console.log('[v0] Sending offer to existing user:', user.userId)
-              sendOffer(roomId, user.userId, signal)
+              sendOffer(roomId, currentUserId, user.userId, signal)
             },
             (error) => console.error('[v0] Peer error:', error),
             () => {
@@ -513,7 +498,7 @@ export default function RoomPage({ roomId }: RoomPageProps) {
         },
         (signal) => {
           console.log('[v0] Sending offer to:', userId)
-          sendOffer(roomId, userId, signal)
+          sendOffer(roomId, currentUserId, userId, signal)
         },
         (error) => console.error('[v0] Peer error:', error),
         () => {
@@ -534,7 +519,7 @@ export default function RoomPage({ roomId }: RoomPageProps) {
   }
 
   // Helper to set up a peer connection with a specific user
-  const setupSinglePeerConnection = (userId: string, userName?: string) => {
+  const setupSinglePeerConnection = (senderUserId: string, userId: string, userName?: string) => {
     if (!webrtcManagerRef.current || webrtcManagerRef.current.isConnectedTo(userId)) {
       return
     }
@@ -559,7 +544,7 @@ export default function RoomPage({ roomId }: RoomPageProps) {
       },
       (signal) => {
         console.log('[v0] Sending offer to:', userId)
-        sendOffer(roomId, userId, signal)
+        sendOffer(roomId, senderUserId, userId, signal)
       },
       (error) => console.error('[v0] Peer error:', error),
       () => {
@@ -612,6 +597,7 @@ export default function RoomPage({ roomId }: RoomPageProps) {
         const participantsList = Array.from(uniqueUsers.values()).map((p: any) => ({
           id: p.id,
           odiceId: p.user_id,
+          user_id: p.user_id,
           username: p.users?.username,
           display_name: p.users?.display_name,
           avatar_url: p.users?.avatar_url,
@@ -688,17 +674,69 @@ export default function RoomPage({ roomId }: RoomPageProps) {
     }
   }
 
+  // Voice activity detection
+  const setupVoiceActivityDetection = () => {
+    try {
+      const localStream = webrtcManagerRef.current?.getLocalStream()
+      if (!localStream) return
+
+      // Create audio context and analyser
+      audioContextRef.current = new AudioContext()
+      analyserRef.current = audioContextRef.current.createAnalyser()
+      analyserRef.current.fftSize = 256
+
+      const source = audioContextRef.current.createMediaStreamSource(localStream)
+      source.connect(analyserRef.current)
+
+      // Check audio levels periodically
+      const checkAudioLevel = () => {
+        if (!analyserRef.current || !isMountedRef.current) return
+
+        const dataArray = new Uint8Array(analyserRef.current.frequencyBinCount)
+        analyserRef.current.getByteFrequencyData(dataArray)
+
+        // Calculate average volume
+        const average = dataArray.reduce((a, b) => a + b) / dataArray.length
+        const isActive = average > 20 // Threshold for detecting speech
+
+        setIsSpeaking(isActive)
+
+        if (isMountedRef.current) {
+          requestAnimationFrame(checkAudioLevel)
+        }
+      }
+
+      checkAudioLevel()
+    } catch (error) {
+      console.warn('[v0] Could not set up voice detection:', error)
+    }
+  }
+
   const toggleAudio = async () => {
     const newState = !isAudioEnabled
     setIsAudioEnabled(newState)
 
-    // Enable/disable audio tracks
+    // Enable/disable audio tracks or initialize stream if not exists
     if (webrtcManagerRef.current) {
       const localStream = webrtcManagerRef.current.getLocalStream()
+
       if (localStream) {
+        // Stream exists - just toggle audio tracks
         localStream.getAudioTracks().forEach(track => {
           track.enabled = newState
         })
+      } else if (newState) {
+        // No stream but enabling audio - initialize with audio only
+        try {
+          const newStream = await webrtcManagerRef.current.initializeLocalStream(true, false)
+          if (localVideoRef.current && newStream) {
+            localVideoRef.current.srcObject = newStream
+          }
+          setLocalStreamReady(true)
+          setupVoiceActivityDetection()
+        } catch (error) {
+          console.error('[v0] Error enabling audio:', error)
+        }
       }
     }
 
@@ -720,13 +758,20 @@ export default function RoomPage({ roomId }: RoomPageProps) {
       const currentStream = webrtcManagerRef.current.getLocalStream()
 
       if (newState) {
-        // Turning video ON - reinitialize stream with both audio and video
+        // Turning video ON - reinitialize stream with video (respect current audio state)
         try {
-          const newStream = await webrtcManagerRef.current.initializeLocalStream(true, true)
+          const audioEnabled = isAudioEnabled // Use current state, not newState
+          const newStream = await webrtcManagerRef.current.initializeLocalStream(audioEnabled, true)
           if (localVideoRef.current && newStream) {
             localVideoRef.current.srcObject = newStream
             localVideoRef.current.play().catch(console.error)
           }
+          // Ensure audio state matches
+          if (audioEnabled) {
+            setIsAudioEnabled(true)
+            setupVoiceActivityDetection()
+          }
+          setLocalStreamReady(true)
 
           // Close all existing peer connections - they'll be recreated with the new stream
           const existingPeers = Array.from(webrtcManagerRef.current.getPeers().keys())
@@ -746,11 +791,11 @@ export default function RoomPage({ roomId }: RoomPageProps) {
               .is('left_at', null)
 
             if (data && currentUser) {
-              const otherUsers = data.filter(p => p.user_id !== currentUser.id)
+              const otherUsers = data.filter((p: { user_id: string }) => p.user_id !== currentUser.id)
               // Create new connections for all other users
               for (const p of otherUsers) {
                 if (!webrtcManagerRef.current?.isConnectedTo(p.user_id)) {
-                  setupSinglePeerConnection(p.user_id, 'User')
+                  setupSinglePeerConnection(currentUser.id, p.user_id, 'User')
                 }
               }
             }
@@ -761,16 +806,21 @@ export default function RoomPage({ roomId }: RoomPageProps) {
           console.error('[v0] Error enabling video:', error)
         }
       } else {
-        // Turning video OFF - just disable the video track
+        // Turning video OFF - stop video tracks and clear the stream
         if (currentStream) {
           currentStream.getVideoTracks().forEach(track => {
-            track.enabled = false
+            track.stop() // Actually stop the camera, not just disable
           })
-          if (localVideoRef.current) {
-            localVideoRef.current.srcObject = null
-          }
+          // Remove video tracks from stream
+          currentStream.getVideoTracks().forEach(track => {
+            currentStream.removeTrack(track)
+          })
         }
-        console.log('[v0] Video toggled OFF')
+        // Also clear the video element
+        if (localVideoRef.current) {
+          localVideoRef.current.srcObject = null
+        }
+        console.log('[v0] Video toggled OFF - camera released')
       }
     }
 
@@ -832,6 +882,11 @@ export default function RoomPage({ roomId }: RoomPageProps) {
   }
 
   const confirmLeaveRoom = async () => {
+    // Stop local stream first to release camera
+    if (webrtcManagerRef.current) {
+      webrtcManagerRef.current.stopLocalStream()
+      webrtcManagerRef.current.closeAllConnections()
+    }
     await leaveRoom()
     // Force refresh to ensure dashboard gets updated room list
     window.location.href = '/'
@@ -907,11 +962,79 @@ export default function RoomPage({ roomId }: RoomPageProps) {
       {/* Main Content - Responsive Layout */}
       <main className="h-[calc(100vh-73px)] flex flex-col sm:flex-row">
         {/* Left Side - Video Area */}
-        <div className="flex-1 p-2 sm:p-4 overflow-y-auto min-h-0">
-          {/* Video Grid */}
-          <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-2 sm:gap-4 mb-4 sm:mb-6">
-            {/* Local Video */}
-            <div className="relative aspect-video bg-muted rounded-lg overflow-hidden">
+        <div className="flex-1 p-2 sm:p-4 overflow-y-auto min-h-0 flex flex-col">
+          {/* Main Remote Video Area - Large view like WhatsApp */}
+          <div className="flex-1 flex items-center justify-center mb-4">
+            {remoteVideos.length > 0 ? (
+              <div className="relative w-full max-w-4xl aspect-video bg-muted rounded-lg overflow-hidden">
+                {remoteVideos[0] && (
+                  <>
+                    <video
+                      ref={(el) => {
+                        if (el && el.srcObject !== remoteVideos[0].stream) {
+                          el.srcObject = remoteVideos[0].stream
+                          el.play().catch(e => console.log('[v0] Video play error:', e.message))
+                        }
+                      }}
+                      autoPlay
+                      playsInline
+                      muted={false}
+                      className="w-full h-full object-cover"
+                    />
+                    <div className="absolute bottom-2 left-2 flex items-center gap-2 bg-black/50 px-2 py-1 rounded">
+                      <Avatar className="h-6 w-6">
+                        <AvatarImage src={remoteVideos[0].avatarUrl || ''} alt={remoteVideos[0].displayName} />
+                        <AvatarFallback className="text-xs">
+                          {remoteVideos[0].displayName?.charAt(0).toUpperCase() || 'U'}
+                        </AvatarFallback>
+                      </Avatar>
+                      <span className="text-white text-sm">{remoteVideos[0].displayName}</span>
+                    </div>
+                  </>
+                )}
+              </div>
+            ) : (
+              <div className="text-center text-muted-foreground">
+                <p>Waiting for other participants...</p>
+                <p className="text-sm">Share the room link to invite others</p>
+              </div>
+            )}
+          </div>
+
+          {/* Other Remote Videos (if more than 1) */}
+          {remoteVideos.length > 1 && (
+            <div className="grid grid-cols-2 md:grid-cols-3 gap-2 mb-4">
+              {remoteVideos.slice(1).map((video) => (
+                <div key={video.odiceId} className="relative aspect-video bg-muted rounded-lg overflow-hidden">
+                  <video
+                    ref={(el) => {
+                      if (el && el.srcObject !== video.stream) {
+                        el.srcObject = video.stream
+                        el.play().catch(e => console.log('[v0] Video play error:', e.message))
+                      }
+                    }}
+                    autoPlay
+                    playsInline
+                    muted={false}
+                    className="w-full h-full object-cover"
+                  />
+                  <div className="absolute bottom-1 left-1 flex items-center gap-1 bg-black/50 px-1 rounded">
+                    <Avatar className="h-4 w-4">
+                      <AvatarImage src={video.avatarUrl || ''} alt={video.displayName} />
+                      <AvatarFallback className="text-[8px]">
+                        {video.displayName?.charAt(0).toUpperCase() || 'U'}
+                      </AvatarFallback>
+                    </Avatar>
+                    <span className="text-white text-xs">{video.displayName}</span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* Local Video - Small Picture-in-Picture like WhatsApp */}
+          <div className="self-end w-32 sm:w-40 md:w-48 lg:w-56">
+            <div className="relative aspect-video bg-muted rounded-lg overflow-hidden shadow-lg border-2 border-background">
               {isVideoEnabled ? (
                 <video
                   ref={localVideoRef}
@@ -922,86 +1045,56 @@ export default function RoomPage({ roomId }: RoomPageProps) {
                 />
               ) : (
                 <div className="absolute inset-0 flex items-center justify-center bg-muted">
-                  <div className="text-center">
-                    <Avatar className="w-16 h-16 mx-auto">
-                      <AvatarImage src={currentUser?.avatar_url || ''} alt={currentUser?.display_name} />
-                      <AvatarFallback className="text-2xl font-bold">
-                        {currentUser?.display_name?.charAt(0).toUpperCase() || 'U'}
-                      </AvatarFallback>
-                    </Avatar>
-                    <p className="text-sm font-medium mt-2">{currentUser?.display_name}</p>
-                    <p className="text-xs text-muted-foreground">You</p>
-                  </div>
-                </div>
-              )}
-              {/* Status indicators */}
-              <div className="absolute bottom-2 left-2 flex gap-1">
-                {!isAudioEnabled && (
-                  <div className="bg-red-500 p-1 rounded">
-                    <MicOff className="h-3 w-3 text-white" />
-                  </div>
-                )}
-                {!isVideoEnabled && (
-                  <div className="bg-red-500 p-1 rounded">
-                    <VideoOff className="h-3 w-3 text-white" />
-                  </div>
-                )}
-              </div>
-            </div>
-
-            {/* Remote Videos - populated by WebRTC */}
-            {remoteVideos.map((video) => (
-              <div key={video.odiceId} className="relative aspect-video bg-muted rounded-lg overflow-hidden">
-                <video
-                  ref={(el) => {
-                    if (el && el.srcObject !== video.stream) {
-                      el.srcObject = video.stream
-                      el.play().catch(console.error)
-                    }
-                    remoteVideoRefs.current.set(video.odiceId, el)
-                  }}
-                  autoPlay
-                  playsInline
-                  muted={false}
-                  className="w-full h-full object-cover"
-                />
-                {/* Show avatar as overlay on video (semi-transparent) */}
-                <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
-                  <Avatar className="w-16 h-16 border-2 border-white bg-black/50">
-                    <AvatarImage src={video.avatarUrl || ''} alt={video.displayName} />
-                    <AvatarFallback className="text-2xl font-bold">
-                      {(video.displayName || 'U').charAt(0).toUpperCase()}
+                  <Avatar className="h-10 w-10 sm:h-12 sm:w-12">
+                    <AvatarImage src={currentUser?.avatar_url || ''} alt={currentUser?.display_name} />
+                    <AvatarFallback className="text-lg font-bold">
+                      {currentUser?.display_name?.charAt(0).toUpperCase() || 'U'}
                     </AvatarFallback>
                   </Avatar>
                 </div>
-                <div className="absolute bottom-2 left-2 z-10">
-                  <p className="text-xs text-white bg-black/50 px-2 py-1 rounded">{video.displayName}</p>
-                </div>
-                <div className="absolute bottom-2 right-2 z-10">
-                  {connectionStatus === 'connected' ? (
-                    <div className="bg-green-500 p-1 rounded-full">
-                      <Mic className="h-3 w-3 text-white" />
-                    </div>
-                  ) : (
-                    <Loader2 className="h-3 w-3 animate-spin text-white" />
-                  )}
-                </div>
+              )}
+              {/* Status indicators */}
+              <div className="absolute bottom-1 left-1 flex gap-1 items-center">
+                {!isAudioEnabled && (
+                  <div className="bg-red-500 p-0.5 rounded">
+                    <MicOff className="h-2.5 w-2.5 text-white" />
+                  </div>
+                )}
+                {isAudioEnabled && isSpeaking && (
+                  <div className="flex items-center gap-0.5 bg-green-500 px-1 rounded h-4">
+                    <span className="w-0.5 h-2 bg-white rounded-full animate-pulse" style={{ animationDelay: '0ms' }} />
+                    <span className="w-0.5 h-3 bg-white rounded-full animate-pulse" style={{ animationDelay: '150ms' }} />
+                    <span className="w-0.5 h-2 bg-white rounded-full animate-pulse" style={{ animationDelay: '300ms' }} />
+                  </div>
+                )}
+                {!isVideoEnabled && (
+                  <div className="bg-red-500 p-0.5 rounded">
+                    <VideoOff className="h-2.5 w-2.5 text-white" />
+                  </div>
+                )}
               </div>
-            ))}
-
-            {/* Hidden audio elements for remote streams */}
-            {remoteVideos.map((video) => (
-              <audio
-                key={`audio-${video.odiceId}`}
-                ref={(el) => {
-                  if (el && el.srcObject !== video.stream) {
-                    el.srcObject = video.stream
-                  }
-                }}
-                autoPlay
-              />
-            ))}
+              <div className="absolute bottom-1 right-1 text-[8px] text-white bg-black/50 px-1 rounded">
+                You
+              </div>
+            </div>
           </div>
+
+          {/* Hidden audio elements for remote streams */}
+          {remoteVideos.map((video) => (
+            <audio
+              key={`audio-${video.odiceId}`}
+              ref={(el) => {
+                if (el && el.srcObject !== video.stream) {
+                  el.srcObject = video.stream
+                  el.play().catch(e => console.log('[v0] Audio play error:', e.message))
+                }
+              }}
+              autoPlay
+              playsInline
+              muted={false}
+            />
+          ))}
+        </div>
 
           {/* Participants List */}
           <div className="bg-card rounded-lg p-4">
@@ -1051,7 +1144,6 @@ export default function RoomPage({ roomId }: RoomPageProps) {
               ))}
             </div>
           </div>
-        </div>
 
         {/* Right Side - Chat - full width on mobile, sidebar on desktop */}
         <div className="w-full sm:w-80 border-t sm:border-l bg-card flex flex-col h-1/3 sm:h-full min-h-[200px] sm:min-h-0">

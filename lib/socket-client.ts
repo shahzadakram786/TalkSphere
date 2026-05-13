@@ -1,9 +1,10 @@
-import { createClient, SupabaseClient } from '@supabase/supabase-js'
+// Supabase Realtime client - uses the existing client from supabase/client.ts
+import { getSupabaseClient } from '@/lib/supabase/client'
 
-let supabase: SupabaseClient | null = null
-let currentChannel: ReturnType<SupabaseClient['channel']> | null = null
+let currentChannel: any = null
 let connectionStatus: 'connected' | 'disconnected' = 'disconnected'
 let eventListeners: Record<string, Function[]> = {}
+let initialized = false
 
 // Socket-like interface for compatibility with existing code
 const socketProxy = {
@@ -35,29 +36,22 @@ const socketProxy = {
 
 /**
  * Initialize Supabase Realtime client
- * Uses Supabase's built-in realtime - no separate server needed
+ * Uses the existing Supabase client from supabase/client.ts
  */
 export function initializeSocket(): typeof socketProxy {
-  if (supabase) {
+  if (initialized) {
     return socketProxy
   }
 
-  const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL!
-  const supabaseKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
+  // Use the existing Supabase client from the app
+  const supabase = getSupabaseClient()
+  initialized = true
 
-  supabase = createClient(supabaseUrl, supabaseKey, {
-    realtime: {
-      params: {
-        eventsPerSecond: 10,
-      },
-    },
-  })
-
-  // Simulate connected status (Supabase channels connect automatically on subscribe)
+  // Simulate connected status
   setTimeout(() => {
     connectionStatus = 'connected'
     eventListeners['connect']?.forEach(cb => cb())
-  }, 100)
+  }, 500)
 
   console.log('[Supabase] Realtime client initialized')
   return socketProxy
@@ -68,7 +62,8 @@ export function getSocket() {
 }
 
 export function disconnectSocket() {
-  if (currentChannel && supabase) {
+  const supabase = getSupabaseClient()
+  if (currentChannel) {
     supabase.removeChannel(currentChannel)
     currentChannel = null
   }
@@ -78,7 +73,7 @@ export function disconnectSocket() {
 
 // Room events
 export function joinRoom(roomId: string, userId: string, userName: string) {
-  if (!supabase) return
+  const supabase = getSupabaseClient()
 
   // Remove any existing channel
   if (currentChannel) {
@@ -93,32 +88,55 @@ export function joinRoom(roomId: string, userId: string, userName: string) {
     },
   })
 
-  // Set up event listeners
-  currentChannel
-    .on('broadcast', { event: 'user-joined' }, (payload: any) => {
-      eventListeners['user-joined']?.forEach(cb => cb(payload.payload))
-      eventListeners[`room:${roomId}:user-joined`]?.forEach(cb => cb(payload.payload))
-    })
-    .on('broadcast', { event: 'user-left' }, (payload: any) => {
-      eventListeners['user-left']?.forEach(cb => cb(payload.payload.userId))
-      eventListeners[`room:${roomId}:user-left`]?.forEach(cb => cb(payload.payload.userId))
-    })
-    .on('broadcast', { event: 'room-users' }, (payload: any) => {
-      eventListeners['room-users']?.forEach(cb => cb(payload.payload))
-      eventListeners[`room:${roomId}:room-users`]?.forEach(cb => cb(payload.payload))
-    })
-    .on('broadcast', { event: 'webrtc-offer' }, (payload: any) => {
-      eventListeners['webrtc-offer']?.forEach(cb => cb({ fromUserId: payload.payload.targetUserId, offer: payload.payload.offer }))
-      eventListeners[`room:${roomId}:webrtc-offer`]?.forEach(cb => cb({ fromUserId: payload.payload.targetUserId, offer: payload.payload.offer }))
-    })
-    .on('broadcast', { event: 'webrtc-answer' }, (payload: any) => {
-      eventListeners['webrtc-answer']?.forEach(cb => cb({ fromUserId: payload.payload.targetUserId, answer: payload.payload.answer }))
-      eventListeners[`room:${roomId}:webrtc-answer`]?.forEach(cb => cb({ fromUserId: payload.payload.targetUserId, answer: payload.payload.answer }))
-    })
-    .on('broadcast', { event: 'webrtc-ice-candidate' }, (payload: any) => {
-      eventListeners['webrtc-ice-candidate']?.forEach(cb => cb({ fromUserId: payload.payload.targetUserId, candidate: payload.payload.candidate }))
-      eventListeners[`room:${roomId}:webrtc-ice-candidate`]?.forEach(cb => cb({ fromUserId: payload.payload.targetUserId, candidate: payload.payload.candidate }))
-    })
+  // Set up event listeners - using the newer API
+  currentChannel.on('broadcast', { event: 'user-joined' }, (payload: any) => {
+    eventListeners['user-joined']?.forEach(cb => cb(payload.payload))
+    eventListeners[`room:${roomId}:user-joined`]?.forEach(cb => cb(payload.payload))
+  })
+  .on('broadcast', { event: 'user-left' }, (payload: any) => {
+    eventListeners['user-left']?.forEach(cb => cb(payload.payload.userId))
+    eventListeners[`room:${roomId}:user-left`]?.forEach(cb => cb(payload.payload.userId))
+  })
+  .on('broadcast', { event: 'room-users' }, (payload: any) => {
+    eventListeners['room-users']?.forEach(cb => cb(payload.payload))
+    eventListeners[`room:${roomId}:room-users`]?.forEach(cb => cb(payload.payload))
+  })
+  .on('broadcast', { event: 'webrtc-offer' }, (payload: any) => {
+    eventListeners['webrtc-offer']?.forEach(cb => cb({
+      fromUserId: payload.payload.senderUserId,
+      targetUserId: payload.payload.targetUserId,
+      offer: payload.payload.offer
+    }))
+    eventListeners[`room:${roomId}:webrtc-offer`]?.forEach(cb => cb({
+      fromUserId: payload.payload.senderUserId,
+      targetUserId: payload.payload.targetUserId,
+      offer: payload.payload.offer
+    }))
+  })
+  .on('broadcast', { event: 'webrtc-answer' }, (payload: any) => {
+    eventListeners['webrtc-answer']?.forEach(cb => cb({
+      fromUserId: payload.payload.senderUserId,
+      targetUserId: payload.payload.targetUserId,
+      answer: payload.payload.answer
+    }))
+    eventListeners[`room:${roomId}:webrtc-answer`]?.forEach(cb => cb({
+      fromUserId: payload.payload.senderUserId,
+      targetUserId: payload.payload.targetUserId,
+      answer: payload.payload.answer
+    }))
+  })
+  .on('broadcast', { event: 'webrtc-ice-candidate' }, (payload: any) => {
+    eventListeners['webrtc-ice-candidate']?.forEach(cb => cb({
+      fromUserId: payload.payload.senderUserId,
+      targetUserId: payload.payload.targetUserId,
+      candidate: payload.payload.candidate
+    }))
+    eventListeners[`room:${roomId}:webrtc-ice-candidate`]?.forEach(cb => cb({
+      fromUserId: payload.payload.senderUserId,
+      targetUserId: payload.payload.targetUserId,
+      candidate: payload.payload.candidate
+    }))
+  })
 
   // Join the channel
   currentChannel.subscribe((status: string) => {
@@ -141,7 +159,8 @@ export function joinRoom(roomId: string, userId: string, userName: string) {
 }
 
 export function leaveRoom(roomId: string) {
-  if (!supabase || !currentChannel) return
+  const supabase = getSupabaseClient()
+  if (!currentChannel) return
 
   currentChannel.send({
     type: 'broadcast',
@@ -155,40 +174,41 @@ export function leaveRoom(roomId: string) {
 }
 
 // WebRTC signaling events
-export function sendOffer(roomId: string, targetUserId: string, offer: any) {
+export function sendOffer(roomId: string, senderUserId: string, targetUserId: string, offer: any) {
   if (!currentChannel) return
-  console.log('[Supabase] Sending offer to:', targetUserId)
+  console.log('[Supabase] Sending offer from:', senderUserId, 'to:', targetUserId)
 
   currentChannel.send({
     type: 'broadcast',
     event: 'webrtc-offer',
-    payload: { targetUserId, offer },
+    payload: { senderUserId, targetUserId, offer },
   })
 }
 
-export function sendAnswer(roomId: string, targetUserId: string, answer: any) {
+export function sendAnswer(roomId: string, senderUserId: string, targetUserId: string, answer: any) {
   if (!currentChannel) return
-  console.log('[Supabase] Sending answer to:', targetUserId)
+  console.log('[Supabase] Sending answer from:', senderUserId, 'to:', targetUserId)
 
   currentChannel.send({
     type: 'broadcast',
     event: 'webrtc-answer',
-    payload: { targetUserId, answer },
+    payload: { senderUserId, targetUserId, answer },
   })
 }
 
 export function sendIceCandidate(
   roomId: string,
+  senderUserId: string,
   targetUserId: string,
   candidate: any
 ) {
   if (!currentChannel) return
-  console.log('[Supabase] Sending ICE to:', targetUserId)
+  console.log('[Supabase] Sending ICE from:', senderUserId, 'to:', targetUserId)
 
   currentChannel.send({
     type: 'broadcast',
     event: 'webrtc-ice-candidate',
-    payload: { targetUserId, candidate },
+    payload: { senderUserId, targetUserId, candidate },
   })
 }
 
@@ -228,7 +248,7 @@ export function onRoomUsers(
 
 export function onWebRTCOffer(
   roomId: string,
-  callback: (data: { fromUserId: string; offer: any }) => void
+  callback: (data: { fromUserId: string; targetUserId: string; offer: any }) => void
 ) {
   eventListeners[`room:${roomId}:webrtc-offer`] = eventListeners[`room:${roomId}:webrtc-offer`] || []
   eventListeners[`room:${roomId}:webrtc-offer`].push(callback)
@@ -236,7 +256,7 @@ export function onWebRTCOffer(
 
 export function onWebRTCAnswer(
   roomId: string,
-  callback: (data: { fromUserId: string; answer: any }) => void
+  callback: (data: { fromUserId: string; targetUserId: string; answer: any }) => void
 ) {
   eventListeners[`room:${roomId}:webrtc-answer`] = eventListeners[`room:${roomId}:webrtc-answer`] || []
   eventListeners[`room:${roomId}:webrtc-answer`].push(callback)
@@ -244,7 +264,7 @@ export function onWebRTCAnswer(
 
 export function onWebRTCIceCandidate(
   roomId: string,
-  callback: (data: { fromUserId: string; candidate: any }) => void
+  callback: (data: { fromUserId: string; targetUserId: string; candidate: any }) => void
 ) {
   eventListeners[`room:${roomId}:webrtc-ice-candidate`] = eventListeners[`room:${roomId}:webrtc-ice-candidate`] || []
   eventListeners[`room:${roomId}:webrtc-ice-candidate`].push(callback)
@@ -275,12 +295,3 @@ export function offWebRTCIceCandidate(roomId: string) {
   delete eventListeners[`room:${roomId}:webrtc-ice-candidate`]
 }
 
-// Re-export for convenience
-export {
-  onUserJoined,
-  onUserLeft,
-  onRoomUsers,
-  onWebRTCOffer,
-  onWebRTCAnswer,
-  onWebRTCIceCandidate,
-}

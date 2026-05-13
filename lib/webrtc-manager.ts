@@ -65,7 +65,7 @@ export class WebRTCManager {
 
     const peer = new SimplePeer({
       initiator,
-      trickleIce: true,
+      trickle: true,
       streams: this.localStream ? [this.localStream] : [],
       config: {
         iceServers: [
@@ -83,6 +83,9 @@ export class WebRTCManager {
 
     peer.on('stream', (stream) => {
       console.log('[WebRTC] Received stream from peer', userId, 'tracks:', stream.getTracks().length)
+      stream.getTracks().forEach(track => {
+        console.log('[WebRTC] Remote track:', track.kind, 'enabled:', track.enabled)
+      })
       onStream(stream)
     })
 
@@ -113,10 +116,47 @@ export class WebRTCManager {
     const peerConnection = this.peers.get(userId)
     if (peerConnection) {
       try {
-        peerConnection.peer.signal(signal)
-      } catch (error) {
-        console.error('[v0] Error signaling peer:', error)
+        const peer = peerConnection.peer
+
+        // Check if we've already processed this exact signal type to avoid duplicates
+        const lastSignal = (peer as any)._lastSignal
+        if (lastSignal && lastSignal.type === signal.type) {
+          console.log('[WebRTC] Skipping duplicate signal:', signal.type)
+          return
+        }
+
+        const pc = (peer as any)._pc as RTCPeerConnection
+
+        // If we're trying to set answer but already in stable state, skip it
+        if (signal.type === 'answer' && pc) {
+          if (pc.signalingState === 'stable') {
+            console.log('[WebRTC] Ignoring answer - already in stable state')
+            return
+          }
+        }
+
+        // If we're trying to set offer but not in correct state, skip it
+        if (signal.type === 'offer' && pc && pc.signalingState !== 'have-local-offer') {
+          console.log('[WebRTC] Skipping offer - not in correct state:', pc.signalingState)
+          return
+        }
+
+        // Store this signal to prevent duplicates
+        ;(peer as any)._lastSignal = signal
+
+        peer.signal(signal)
+      } catch (error: any) {
+        // Handle InvalidStateError gracefully
+        if (error?.name === 'InvalidStateError') {
+          console.log('[WebRTC] InvalidStateError - connection may have changed, ignoring')
+          // Clear last signal so we can try again
+          ;(peerConnection.peer as any)._lastSignal = null
+          return
+        }
+        console.error('[WebRTC] Error signaling peer:', error)
       }
+    } else {
+      console.log('[WebRTC] No peer connection found for:', userId)
     }
   }
 
@@ -189,13 +229,13 @@ export class WebRTCManager {
         // SimplePeer doesn't have a direct method to replace stream
         // But we can use the addStream method if available, or rebuild
         const peer = connection.peer
-        if (peer && peer._pc) {
-          const pc = peer._pc
+        const pc = (peer as any)._pc as RTCPeerConnection | undefined
+        if (peer && pc) {
           // Replace video track in the sender
           const videoTrack = newStream.getVideoTracks()[0]
           const audioTrack = newStream.getAudioTracks()[0]
 
-          pc.getSenders().forEach(sender => {
+          pc.getSenders().forEach((sender: RTCRtpSender) => {
             if (sender.track?.kind === 'video' && videoTrack) {
               sender.replaceTrack(videoTrack)
             }
