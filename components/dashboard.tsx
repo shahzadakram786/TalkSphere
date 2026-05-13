@@ -78,7 +78,11 @@ interface Stats {
   popularTopics: { name: string; count: number }[]
 }
 
-export default function Dashboard() {
+interface Props {
+  user?: { id: string } | null
+}
+
+export default function Dashboard({ user: initialUser }: Props) {
   const router = useRouter()
   const supabase = createClient()
   const [user, setUser] = useState<User | null>(null)
@@ -122,9 +126,14 @@ export default function Dashboard() {
   const [currentRoomId, setCurrentRoomId] = useState<string | null>(null)
   const [pendingRoomId, setPendingRoomId] = useState<string | null>(null)
   const [showJoinConfirm, setShowJoinConfirm] = useState(false)
+  const isMountedRef = useRef(false)
 
   useEffect(() => {
+    isMountedRef.current = true
     loadUserAndRooms()
+    return () => {
+      isMountedRef.current = false
+    }
   }, [])
 
   // Apply filters whenever rooms or filter state changes
@@ -173,36 +182,37 @@ export default function Dashboard() {
     setFilteredRooms(filtered)
   }, [rooms, searchQuery, languageFilter, levelFilter, roomTypeFilter, sortBy])
 
-  const loadUserAndRooms = useCallback(async () => {
+  const loadUserAndRooms = useCallback(async (skipAuth = false) => {
+    if (!isMountedRef.current) return
+
     try {
       setLoading(true)
       setLoadError(null)
 
       const { data: { user: authUser } } = await supabase.auth.getUser()
-      if (!authUser) {
-        router.push('/auth/login')
-        return
-      }
+      const currentUser = authUser || initialUser
 
-      // Get user profile
-      const { data: userProfile } = await supabase
-        .from('users')
-        .select('*')
-        .eq('id', authUser.id)
-        .single()
+      if (currentUser) {
+        // Get user profile
+        const { data: userProfile } = await supabase
+          .from('users')
+          .select('*')
+          .eq('id', currentUser.id)
+          .single()
 
-      setUser(userProfile)
+        setUser(userProfile)
 
-      // Check if user is in any room
-      const { data: currentParticipant } = await supabase
-        .from('room_participants')
-        .select('room_id')
-        .eq('user_id', authUser.id)
-        .is('left_at', null)
-        .maybeSingle()
+        // Check if user is in any room
+        const { data: currentParticipant } = await supabase
+          .from('room_participants')
+          .select('room_id')
+          .eq('user_id', currentUser.id)
+          .is('left_at', null)
+          .maybeSingle()
 
-      if (currentParticipant) {
-        setCurrentRoomId(currentParticipant.room_id)
+        if (currentParticipant) {
+          setCurrentRoomId(currentParticipant.room_id)
+        }
       }
 
       // Get all public rooms
@@ -267,9 +277,11 @@ export default function Dashboard() {
     } catch (error) {
       console.error('[v0] Error loading data:', error)
     } finally {
-      setLoading(false)
+      if (isMountedRef.current) {
+        setLoading(false)
+      }
     }
-  }, [router, supabase])
+  }, [router, supabase, initialUser])
 
   const handleCreateRoom = async () => {
     setCreateError(null)
@@ -280,9 +292,10 @@ export default function Dashboard() {
     }
 
     const { data: { user: authUser } } = await supabase.auth.getUser()
+    const currentUser = authUser || initialUser
 
-    if (!authUser) {
-      setCreateError('You must be logged in to create a room')
+    if (!currentUser) {
+      router.push('/auth/login?redirect=/')
       return
     }
 
@@ -296,7 +309,7 @@ export default function Dashboard() {
           description: newRoom.description.trim(),
           room_type: newRoom.room_type,
           is_public: newRoom.is_public,
-          host_id: authUser.id,
+          host_id: currentUser.id,
           language: newRoom.language,
           level: newRoom.level,
           max_capacity: newRoom.max_capacity,
@@ -311,7 +324,7 @@ export default function Dashboard() {
         // Join room as host
         await supabase.from('room_participants').insert({
           room_id: data.id,
-          user_id: authUser.id,
+          user_id: currentUser.id,
           is_audio_enabled: true,
           is_video_enabled: false,
         })
@@ -442,6 +455,11 @@ export default function Dashboard() {
   }
 
   const handleRoomClick = (roomId: string) => {
+    if (!user) {
+      router.push(`/auth/login?redirect=/room/${roomId}`)
+      return
+    }
+
     if (currentRoomId && currentRoomId !== roomId) {
       setPendingRoomId(roomId)
       setShowJoinConfirm(true)
@@ -482,23 +500,23 @@ export default function Dashboard() {
     <div className="min-h-screen bg-background">
       {/* Header */}
       <header className="border-b bg-card sticky top-0 z-50">
-        <div className="container mx-auto flex items-center justify-between px-4 py-3">
+        <div className="container mx-auto flex items-center justify-between px-2 sm:px-4 py-3 gap-2">
           {/* Logo */}
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 min-w-0">
             <img
               src="/Untitled design/favicon.png"
               alt="TalkSphere"
-              className="h-10 w-10 rounded-lg bg-white p-1"
+              className="h-8 w-8 sm:h-10 sm:w-10 rounded-lg bg-white p-1 flex-shrink-0"
             />
-            <h1 className="text-xl font-bold">TalkSphere</h1>
+            <h1 className="text-lg sm:text-xl font-bold truncate">TalkSphere</h1>
           </div>
 
-          {/* Search Bar */}
-          <div className="flex-1 max-w-xl mx-8">
-            <div className="relative">
+          {/* Search Bar - hidden on small screens */}
+          <div className="hidden md:flex flex-1 max-w-xl mx-4">
+            <div className="relative w-full">
               <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 h-4 w-4 text-muted-foreground" />
               <Input
-                placeholder="Search rooms by name, topic, or host..."
+                placeholder="Search rooms..."
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
                 className="pl-10 bg-muted/50"
@@ -507,56 +525,74 @@ export default function Dashboard() {
           </div>
 
           {/* Right side */}
-          <div className="flex items-center gap-4">
-            <Button variant="outline" size="sm" onClick={loadUserAndRooms}>
-              <RefreshCw className="h-4 w-4 mr-2" />
-              Refresh
-            </Button>
-            <DropdownMenu>
-              <DropdownMenuTrigger asChild>
-                <Button variant="ghost" className="flex items-center gap-2 px-2">
-                  <Avatar className="h-8 w-8">
-                    <AvatarImage src={user?.avatar_url || ''} alt={user?.display_name} />
-                    <AvatarFallback>
-                      {(user?.display_name || user?.username || 'U').charAt(0).toUpperCase()}
-                    </AvatarFallback>
-                  </Avatar>
-                  <span className="text-sm font-medium hidden md:inline">{user?.display_name || user?.username}</span>
+          <div className="flex items-center gap-1 sm:gap-2">
+            {user ? (
+              <>
+                <Button variant="outline" size="sm" onClick={loadUserAndRooms} className="hidden sm:flex">
+                  <RefreshCw className="h-4 w-4 mr-1" />
+                  <span className="hidden lg:inline">Refresh</span>
                 </Button>
-              </DropdownMenuTrigger>
-              <DropdownMenuContent align="end" className="w-56">
-                <DropdownMenuLabel>{user?.display_name || user?.username}</DropdownMenuLabel>
-                <DropdownMenuSeparator />
-                <div className="px-2 py-1.5 text-sm text-muted-foreground">@{user?.username}</div>
-                <DropdownMenuSeparator />
-                <DropdownMenuItem onClick={openProfileDialog}>
-                  <User className="mr-2 h-4 w-4" />
-                  Profile
-                </DropdownMenuItem>
-                <DropdownMenuItem onClick={() => router.push('/settings')}>
-                  <Settings className="mr-2 h-4 w-4" />
-                  Settings
-                </DropdownMenuItem>
-                <DropdownMenuSeparator />
-                <DropdownMenuItem onClick={handleLogout} className="text-red-600">
-                  <LogOut className="mr-2 h-4 w-4" />
-                  Logout
-                </DropdownMenuItem>
-              </DropdownMenuContent>
-            </DropdownMenu>
+                <Button variant="outline" size="sm" onClick={loadUserAndRooms} className="sm:hidden p-2">
+                  <RefreshCw className="h-4 w-4" />
+                </Button>
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <Button variant="ghost" className="flex items-center gap-1 sm:gap-2 px-1 sm:px-2">
+                      <Avatar className="h-8 w-8">
+                        <AvatarImage src={user?.avatar_url || ''} alt={user?.display_name} />
+                        <AvatarFallback>
+                          {(user?.display_name || user?.username || 'U').charAt(0).toUpperCase()}
+                        </AvatarFallback>
+                      </Avatar>
+                      <span className="text-sm font-medium hidden md:inline truncate max-w-[100px]">{user?.display_name || user?.username}</span>
+                    </Button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="end" className="w-56">
+                    <DropdownMenuLabel>{user?.display_name || user?.username}</DropdownMenuLabel>
+                    <DropdownMenuSeparator />
+                    <div className="px-2 py-1.5 text-sm text-muted-foreground">@{user?.username}</div>
+                    <DropdownMenuSeparator />
+                    <DropdownMenuItem onClick={openProfileDialog}>
+                      <User className="mr-2 h-4 w-4" />
+                      Profile
+                    </DropdownMenuItem>
+                    <DropdownMenuItem onClick={() => router.push('/settings')}>
+                      <Settings className="mr-2 h-4 w-4" />
+                      Settings
+                    </DropdownMenuItem>
+                    <DropdownMenuSeparator />
+                    <DropdownMenuItem onClick={handleLogout} className="text-red-600">
+                      <LogOut className="mr-2 h-4 w-4" />
+                      Logout
+                    </DropdownMenuItem>
+                  </DropdownMenuContent>
+                </DropdownMenu>
+              </>
+            ) : (
+              <div className="flex items-center gap-1 sm:gap-2">
+                <Button variant="ghost" size="sm" onClick={() => router.push('/auth/login')}>
+                  <span className="hidden sm:inline">Log in</span>
+                  <span className="sm:hidden">Login</span>
+                </Button>
+                <Button size="sm" onClick={() => router.push('/auth/sign-up')}>
+                  <span className="hidden sm:inline">Sign up</span>
+                  <span className="sm:hidden">Sign Up</span>
+                </Button>
+              </div>
+            )}
           </div>
         </div>
       </header>
 
       {/* Filters Bar */}
       <div className="border-b bg-card/50 backdrop-blur-sm">
-        <div className="container mx-auto px-4 py-3">
-          <div className="flex flex-wrap items-center gap-4">
+        <div className="container mx-auto px-2 sm:px-4 py-3">
+          <div className="flex flex-wrap items-center gap-2 sm:gap-4">
             {/* Language Filter */}
-            <div className="flex items-center gap-2">
-              <Globe className="h-4 w-4 text-muted-foreground" />
+            <div className="flex items-center gap-1 sm:gap-2">
+              <Globe className="h-4 w-4 text-muted-foreground hidden sm:block" />
               <Select value={languageFilter} onValueChange={setLanguageFilter}>
-                <SelectTrigger className="w-40">
+                <SelectTrigger className="w-28 sm:w-40">
                   <SelectValue placeholder="Language" />
                 </SelectTrigger>
                 <SelectContent>
@@ -569,10 +605,10 @@ export default function Dashboard() {
             </div>
 
             {/* Level Filter */}
-            <div className="flex items-center gap-2">
-              <BarChart3 className="h-4 w-4 text-muted-foreground" />
+            <div className="flex items-center gap-1 sm:gap-2">
+              <BarChart3 className="h-4 w-4 text-muted-foreground hidden sm:block" />
               <Select value={levelFilter} onValueChange={setLevelFilter}>
-                <SelectTrigger className="w-40">
+                <SelectTrigger className="w-28 sm:w-40">
                   <SelectValue placeholder="Level" />
                 </SelectTrigger>
                 <SelectContent>
@@ -586,7 +622,7 @@ export default function Dashboard() {
 
             {/* Room Type Filter */}
             <Select value={roomTypeFilter} onValueChange={setRoomTypeFilter}>
-              <SelectTrigger className="w-40">
+              <SelectTrigger className="w-28 sm:w-40">
                 <SelectValue placeholder="Room Type" />
               </SelectTrigger>
               <SelectContent>
@@ -598,7 +634,7 @@ export default function Dashboard() {
 
             {/* Sort */}
             <Select value={sortBy} onValueChange={setSortBy}>
-              <SelectTrigger className="w-40">
+              <SelectTrigger className="w-28 sm:w-40">
                 <SelectValue placeholder="Sort by" />
               </SelectTrigger>
               <SelectContent>
@@ -607,7 +643,7 @@ export default function Dashboard() {
               </SelectContent>
             </Select>
 
-            <div className="ml-auto text-sm text-muted-foreground">
+            <div className="ml-auto text-xs sm:text-sm text-muted-foreground">
               {filteredRooms.length} room{filteredRooms.length !== 1 ? 's' : ''} found
             </div>
           </div>
@@ -615,10 +651,10 @@ export default function Dashboard() {
       </div>
 
       {/* Main Content */}
-      <main className="container mx-auto px-4 py-6">
-        <div className="flex gap-6">
-          {/* Sidebar */}
-          <aside className="w-64 flex-shrink-0 hidden md:block">
+      <main className="container mx-auto px-2 sm:px-4 py-4 sm:py-6">
+        <div className="flex flex-col md:flex-row gap-4 md:gap-6">
+          {/* Sidebar - Desktop only */}
+          <aside className="w-full md:w-64 flex-shrink-0 hidden md:block">
             <div className="sticky top-24 space-y-4">
               {/* Stats Card */}
               <div className="bg-card rounded-lg p-4 border">
@@ -655,13 +691,14 @@ export default function Dashboard() {
 
           {/* Room Grid */}
           <div className="flex-1">
-            <div className="flex items-center justify-between mb-6">
-              <h2 className="text-2xl font-bold">Rooms</h2>
+            <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 mb-4 sm:mb-6">
+              <h2 className="text-xl sm:text-2xl font-bold">Rooms</h2>
               <Dialog>
                 <DialogTrigger asChild>
-                  <Button>
-                    <Plus className="mr-2 h-4 w-4" />
-                    Create Room
+                  <Button size="sm" className="w-full sm:w-auto">
+                    <Plus className="mr-1 sm:mr-2 h-4 w-4" />
+                    <span className="sm:hidden">Create</span>
+                    <span className="hidden sm:inline">Create Room</span>
                   </Button>
                 </DialogTrigger>
                 <DialogContent className="max-w-lg">

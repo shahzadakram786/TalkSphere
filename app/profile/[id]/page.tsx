@@ -3,12 +3,13 @@
 import { useEffect, useState } from 'react'
 import { createClient } from '@/lib/supabase/client'
 import { useRouter, useParams } from 'next/navigation'
+import Link from 'next/link'
 import { Button } from '@/components/ui/button'
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
 import { Badge } from '@/components/ui/badge'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
-import { Globe, Calendar, Clock, Users, Crown, MessageSquare, Activity, Award } from 'lucide-react'
+import { Globe, Calendar, Clock, Users, Crown, MessageSquare, Activity, Award, ArrowLeft } from 'lucide-react'
 
 interface ProfileUser {
   id: string
@@ -20,6 +21,7 @@ interface ProfileUser {
   learning_languages?: string[]
   created_at: string
   total_talk_time?: number
+  email?: string
 }
 
 interface Room {
@@ -67,7 +69,12 @@ export default function ProfilePage() {
         .single()
 
       if (profileData) {
-        setProfileUser(profileData)
+        // Only show email to the profile owner
+        const isOwnProfile = authUser?.id === params.id
+        const profileWithEmail = isOwnProfile && authUser?.email
+          ? { ...profileData, email: authUser.email }
+          : profileData
+        setProfileUser(profileWithEmail)
 
         // Check if following
         if (authUser && authUser.id !== params.id) {
@@ -166,13 +173,31 @@ export default function ProfilePage() {
   const isOwnProfile = currentUser?.id === profileUser.id
 
   return (
-    <div className="min-h-screen bg-background">
+    <div className="min-h-screen bg-background flex flex-col">
       {/* Header */}
       <header className="border-b bg-card">
-        <div className="container mx-auto px-4 py-4">
-          <Button variant="ghost" onClick={() => router.back()} className="mb-4">
-            ← Back
-          </Button>
+        <div className="container mx-auto flex items-center justify-between px-4 py-4">
+          <div className="flex items-center gap-4">
+            <Link href="/" className="flex items-center gap-2">
+              <img
+                src="/Untitled design/favicon.png"
+                alt="TalkSphere"
+                className="h-10 w-10 rounded-lg bg-white p-1"
+              />
+              <h1 className="text-xl font-bold">TalkSphere</h1>
+            </Link>
+            <div className="hidden md:block border-l h-8 mx-2" />
+            <div>
+              <h2 className="text-lg font-semibold">Profile</h2>
+              <p className="text-sm text-muted-foreground">@{profileUser?.username}</p>
+            </div>
+          </div>
+          <Link href="/">
+            <Button variant="ghost" size="sm">
+              <ArrowLeft className="h-4 w-4" />
+              <span className="ml-1 hidden sm:inline">Back</span>
+            </Button>
+          </Link>
         </div>
       </header>
 
@@ -197,6 +222,14 @@ export default function ProfilePage() {
                 )}
               </div>
               <p className="text-muted-foreground mb-3">@{profileUser.username}</p>
+
+              {/* Email - only visible to profile owner */}
+              {profileUser.email && (
+                <p className="text-sm text-muted-foreground mb-3 flex items-center gap-2">
+                  {profileUser.email}
+                  <Badge variant="outline" className="text-xs">Private</Badge>
+                </p>
+              )}
 
               {/* Language badges */}
               <div className="flex flex-wrap gap-2 mb-4">

@@ -3,6 +3,7 @@
 import { useEffect, useState, useRef } from 'react'
 import { createClient } from '@/lib/supabase/client'
 import { useRouter } from 'next/navigation'
+import Link from 'next/link'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -12,7 +13,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/com
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Switch } from '@/components/ui/switch'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
-import { Camera, Loader2, User, Bell, Lock, Volume2, Trash2, LogOut } from 'lucide-react'
+import { Camera, Loader2, User, Bell, Lock, Volume2, Trash2, LogOut, ArrowLeft } from 'lucide-react'
 
 interface UserProfile {
   id: string
@@ -211,42 +212,56 @@ export default function SettingsPage() {
   }
 
   return (
-    <div className="min-h-screen bg-background">
+    <div className="min-h-screen bg-background flex flex-col">
       {/* Header */}
       <header className="border-b bg-card">
-        <div className="container mx-auto px-4 py-4 flex items-center justify-between">
-          <div>
-            <h1 className="text-2xl font-bold">Settings</h1>
-            <p className="text-muted-foreground">Manage your account and preferences</p>
+        <div className="container mx-auto flex items-center justify-between px-2 sm:px-4 py-3 sm:py-4 gap-2">
+          <div className="flex items-center gap-2 sm:gap-4 min-w-0">
+            <Link href="/" className="flex items-center gap-2 flex-shrink-0">
+              <img
+                src="/Untitled design/favicon.png"
+                alt="TalkSphere"
+                className="h-8 w-8 sm:h-10 sm:w-10 rounded-lg bg-white p-1"
+              />
+              <h1 className="text-lg sm:text-xl font-bold hidden sm:block">TalkSphere</h1>
+            </Link>
+            <div className="hidden md:block border-l h-8 mx-2" />
+            <div className="min-w-0">
+              <h2 className="text-base sm:text-lg font-semibold">Settings</h2>
+              <p className="text-xs sm:text-sm text-muted-foreground hidden sm:block">Manage your account</p>
+            </div>
           </div>
-          <Button variant="ghost" onClick={() => router.push('/')}>
-            ← Back to Dashboard
-          </Button>
+          <Link href="/">
+            <Button variant="ghost" size="sm">
+              <ArrowLeft className="h-4 w-4" />
+              <span className="ml-1 hidden sm:inline">Back</span>
+            </Button>
+          </Link>
         </div>
       </header>
 
-      <main className="container mx-auto px-4 py-8">
+      <main className="container mx-auto px-2 sm:px-4 py-4 sm:py-8">
         <Tabs defaultValue="profile" className="max-w-4xl">
-          <TabsList className="w-full justify-start">
-            <TabsTrigger value="profile" className="gap-2">
+          <TabsList className="w-full justify-start overflow-x-auto">
+            <TabsTrigger value="profile" className="gap-1 sm:gap-2">
               <User className="h-4 w-4" />
-              Profile
+              <span className="hidden sm:inline">Profile</span>
             </TabsTrigger>
-            <TabsTrigger value="notifications" className="gap-2">
+            <TabsTrigger value="notifications" className="gap-1 sm:gap-2">
               <Bell className="h-4 w-4" />
-              Notifications
+              <span className="hidden sm:inline">Notifications</span>
             </TabsTrigger>
-            <TabsTrigger value="privacy" className="gap-2">
+            <TabsTrigger value="privacy" className="gap-1 sm:gap-2">
               <Lock className="h-4 w-4" />
-              Privacy
+              <span className="hidden sm:inline">Privacy</span>
             </TabsTrigger>
-            <TabsTrigger value="audio-video" className="gap-2">
+            <TabsTrigger value="audio-video" className="gap-1 sm:gap-2">
               <Volume2 className="h-4 w-4" />
-              Audio/Video
+              <span className="hidden sm:inline">Audio/Video</span>
             </TabsTrigger>
-            <TabsTrigger value="account" className="gap-2">
+            <TabsTrigger value="account" className="gap-1 sm:gap-2">
               <LogOut className="h-4 w-4" />
-              Account
+              <span className="hidden sm:inline">Account</span>
             </TabsTrigger>
           </TabsList>
 

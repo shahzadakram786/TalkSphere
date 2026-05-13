@@ -19,6 +19,7 @@ export class WebRTCManager {
     video: boolean = false
   ): Promise<MediaStream> {
     try {
+      console.log('[WebRTC] Requesting media, audio:', audio, 'video:', video)
       this.localStream = await navigator.mediaDevices.getUserMedia({
         audio,
         video: video
@@ -28,9 +29,13 @@ export class WebRTCManager {
             }
           : false,
       })
+      console.log('[WebRTC] Local stream created with', this.localStream.getTracks().length, 'tracks')
+      this.localStream.getTracks().forEach(track => {
+        console.log('[WebRTC] Track:', track.kind, 'enabled:', track.enabled)
+      })
       return this.localStream
     } catch (error) {
-      console.error('[v0] Error getting user media:', error)
+      console.error('[WebRTC] Error getting user media:', error)
       throw error
     }
   }
@@ -56,35 +61,38 @@ export class WebRTCManager {
     onError: (error: Error) => void,
     onClose: () => void
   ): SimplePeer.Instance {
+    console.log('[WebRTC] Creating peer connection for:', userId, 'initiator:', initiator)
+
     const peer = new SimplePeer({
       initiator,
       trickleIce: true,
       streams: this.localStream ? [this.localStream] : [],
       config: {
         iceServers: [
-          { urls: ['stun:stun.l.google.com:19302'] },
-          { urls: ['stun:stun1.l.google.com:19302'] },
+          { urls: 'stun:stun.l.google.com:19302' },
+          { urls: 'stun:stun1.l.google.com:19302' },
+          { urls: 'stun:stun2.l.google.com:19302' },
         ],
       },
     })
 
     peer.on('signal', (signal) => {
-      console.log('[v0] Signal from peer', userId, signal.type)
+      console.log('[WebRTC] Signal from peer', userId, ':', signal.type || 'candidate')
       onSignal(signal)
     })
 
     peer.on('stream', (stream) => {
-      console.log('[v0] Received stream from peer', userId)
+      console.log('[WebRTC] Received stream from peer', userId, 'tracks:', stream.getTracks().length)
       onStream(stream)
     })
 
     peer.on('error', (error) => {
-      console.error('[v0] Peer error:', error)
+      console.error('[WebRTC] Peer error:', userId, error)
       onError(error)
     })
 
     peer.on('close', () => {
-      console.log('[v0] Peer connection closed:', userId)
+      console.log('[WebRTC] Peer connection closed:', userId)
       this.peers.delete(userId)
       this.peerConnections.delete(userId)
       onClose()
@@ -169,6 +177,38 @@ export class WebRTCManager {
         track.enabled = enabled
       })
     }
+  }
+
+  /**
+   * Update all peer connections with new stream
+   * Called when local stream changes (e.g., video enabled/disabled)
+   */
+  updateStreamForPeers(newStream: MediaStream) {
+    this.peers.forEach((connection, userId) => {
+      try {
+        // SimplePeer doesn't have a direct method to replace stream
+        // But we can use the addStream method if available, or rebuild
+        const peer = connection.peer
+        if (peer && peer._pc) {
+          const pc = peer._pc
+          // Replace video track in the sender
+          const videoTrack = newStream.getVideoTracks()[0]
+          const audioTrack = newStream.getAudioTracks()[0]
+
+          pc.getSenders().forEach(sender => {
+            if (sender.track?.kind === 'video' && videoTrack) {
+              sender.replaceTrack(videoTrack)
+            }
+            if (sender.track?.kind === 'audio' && audioTrack) {
+              sender.replaceTrack(audioTrack)
+            }
+          })
+          console.log('[WebRTC] Updated stream for peer:', userId)
+        }
+      } catch (error) {
+        console.error('[WebRTC] Error updating stream for peer:', userId, error)
+      }
+    })
   }
 
   /**
